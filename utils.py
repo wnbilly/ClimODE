@@ -1,10 +1,7 @@
 import numpy as np
-import xarray as xr
 import random
 import os
 import torch
-import properscoring as ps
-
 
 BOUNDARIES = {
     'NorthAmerica': {  # 8x14
@@ -34,7 +31,7 @@ BOUNDARIES = {
 }
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, file_path='checkpoint.pt'):
+def save_checkpoint(model, optimizer, scheduler, epoch, file_path, verbose=False):
     checkpoint = {
         'epoch'    : epoch,
         'model'    : model.state_dict(),
@@ -42,19 +39,22 @@ def save_checkpoint(model, optimizer, scheduler, epoch, file_path='checkpoint.pt
         'scheduler': scheduler.state_dict()
     }
     torch.save(checkpoint, file_path)
-    print(f"Checkpoint saved to {file_path}")
+    if verbose:
+        print(f"Checkpoint saved to {file_path}")
 
 
-def load_checkpoint(model, optimizer, scheduler, file_path='checkpoint.pt'):
+def load_checkpoint(file_path, model, optimizer=None, scheduler=None, device=None):
     # Note: Input model & optimizer should be pre-defined. This routine only updates their states.
     start_epoch = 0
     if os.path.exists(file_path):
         print(f"Loading checkpoint {file_path}")
-        checkpoint = torch.load(file_path)
+        checkpoint = torch.load(file_path, weights_only=False, map_location=device)
         start_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        scheduler.load_state_dict(checkpoint['scheduler'])
+        if optimizer is not None:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+        if scheduler is not None:
+            scheduler.load_state_dict(checkpoint['scheduler'])
         print(f"Loaded checkpoint at epoch {start_epoch}")
     else:
         print(f"No checkpoint found at {file_path}")
@@ -63,12 +63,9 @@ def load_checkpoint(model, optimizer, scheduler, file_path='checkpoint.pt'):
 
 
 def verif_path(path_):
-    if os.path.isdir(path_):
+    if not os.path.exists(path_):
         os.makedirs(path_)
-    else:
-        dirname_ = os.path.dirname(path_)
-        if not os.path.exists(dirname_):
-            os.makedirs(dirname_)
+
 
 def set_seed(seed: int = 42) -> None:
     np.random.seed(seed)
@@ -85,87 +82,71 @@ def set_seed(seed: int = 42) -> None:
 
 # Section 3.8 : Loss
 def negative_log_likelihood(mean, std, truth, var_coeff):
-    normal_lkl = torch.distributions.normal.Normal(mean, 1e-3 + std)
-    observations_negative_log_likelihood = - normal_lkl.log_prob(truth)
+    predicted_gaussian_distribution = torch.distributions.normal.Normal(mean, std + 1e-3)
+    observations_negative_log_likelihood = - predicted_gaussian_distribution.log_prob(truth)
     # Equation (12) with var_coeff being the hypervariance (variance weight) parameter
     loss = observations_negative_log_likelihood.mean() + var_coeff * (std ** 2).sum()
     return loss
 
 
-def evaluation_rmsd_mm(pred, truth, latitude, longitude, max_vals, min_vals, H, W, levels):
-    RMSD_final = []
-    RMSD_lat_lon = []
-    true_lat_lon = []
-    pred_lat_lon = []
-    for idx, lev in enumerate(levels):
-        true_idx = idx
-        das_pred = []
-        das_true = []
-        pred_spectral = pred[idx].detach().cpu().numpy()
-        true_spectral = truth[true_idx, :, :].detach().cpu().numpy()
+def custom_loss(mean, std, truth, var_coeff):
+    return torch.nn.functional.mse_loss(mean, truth, reduction='mean') + var_coeff * (std ** 2).sum()
 
-        curr_pred = pred_spectral * (max_vals[idx] - min_vals[idx]) + min_vals[idx]
 
-        das_pred.append(
-            xr.DataArray(curr_pred.reshape(1, H, W), dims=['time', 'lat', 'lon'], coords={'time': [0], 'lat': latitude, 'lon': longitude}, name=lev)
+def latitude_weighted_rmse(target, predicted, latitude_grid, latitude_is_rad=False):
+    '''
+
+    :param target: (batch_size, n_timesteps, n_levels, lat, lon)
+    :param predicted: (batch_size, n_timesteps, n_levels, lat, lon)
+    :param latitude_grid: latitude in radians
+    :return:
+    '''
+
+    batch_dim = 0
+    temporal_dim = 1
+    spatial_dims = (3, 4)
+
+    if not latitude_is_rad:
+        latitude_grid = torch.deg2rad(latitude_grid)
+
+    latitude_weights = torch.cos(latitude_grid)
+    latitude_weights /= latitude_weights.mean()
+
+    spatial_rmse = torch.mean(latitude_weights * ((predicted - target) ** 2), dim=spatial_dims)
+
+    lat_rmse_per_sample_per_level = torch.mean(torch.sqrt(spatial_rmse), dim=temporal_dim)
+
+    return torch.sum(lat_rmse_per_sample_per_level, dim=batch_dim)
+
+
+def anomaly_correlation_coefficient(target, predicted, latitude_grid, latitude_is_rad=False, reduction='sum'):
+    '''
+
+    :param target: (batch_size, n_timesteps, n_levels, lat, lon)
+    :param predicted: (batch_size, n_timesteps, n_levels, lat, lon)
+    :param latitude_grid:
+    :param latitude_is_rad:
+    :param reduction:
+    :return:
+    '''
+    target_temporal_mean = target.mean(dim=1, keepdim=True)  #  time dim is 1
+
+    batch_dim = 0
+    spatio_temporal_dims = (1, 3, 4)
+
+    if not latitude_is_rad:
+        latitude_grid = torch.deg2rad(latitude_grid)
+
+    latitude_weights = torch.cos(latitude_grid)
+    latitude_weights /= latitude_weights.mean()
+
+    target_tilde = target - target_temporal_mean
+    predicted_tilde = predicted - target_temporal_mean
+
+    acc_per_sample_per_level = (torch.sum(latitude_weights * target_tilde * predicted_tilde, dim=spatio_temporal_dims) / torch.sqrt(
+        torch.sum(latitude_weights * (target_tilde ** 2), dim=spatio_temporal_dims) * torch.sum(
+            latitude_weights * (predicted_tilde ** 2), dim=spatio_temporal_dims
         )
-        pred_xr = xr.merge(das_pred)
+    ))
 
-        true = true_spectral * (max_vals[idx] - min_vals[idx]) + min_vals[idx]
-
-        das_true.append(
-            xr.DataArray(true.reshape(1, H, W), dims=['time', 'lat', 'lon'], coords={'time': [0], 'lat': latitude, 'lon': longitude}, name=lev)
-        )
-        True_xr = xr.merge(das_true)
-        error = pred_xr - True_xr
-        weights_lat = np.cos(np.deg2rad(error.lat))
-        weights_lat /= weights_lat.mean()
-        rmse = np.sqrt(((error) ** 2 * weights_lat).mean(dim=['lat', 'lon'])).mean(dim=['time'])
-        lat_lon_rmse = np.sqrt((error) ** 2)
-        RMSD_lat_lon.append(lat_lon_rmse[lev].values)
-        RMSD_final.append(rmse[lev].values.tolist())
-
-    return RMSD_final
-
-
-def anomaly_correlation_coefficient(pred, truth, lat, lon, max_vals, min_vals, H, W, levels, clim):
-    acc_list = []
-
-    for idx, lev in enumerate(levels):
-        pred_spectral = pred[idx].detach().cpu().numpy()
-        true_spectral = truth[idx, :, :].detach().cpu().numpy()
-        pred_spectral = pred_spectral - clim[idx].detach().numpy()
-        true_spectral = true_spectral - clim[idx].detach().numpy()
-
-        curr_pred = pred_spectral * (max_vals[idx] - min_vals[idx]) + min_vals[idx]
-        true = true_spectral * (max_vals[idx] - min_vals[idx]) + min_vals[idx]
-
-        weights_lat = np.cos(np.deg2rad(lat))
-        weights_lat /= weights_lat.mean()
-        weights_lat = weights_lat.reshape(len(lat), 1)
-        weights_lat = weights_lat.repeat(len(lon), 1)
-
-        pred_prime = curr_pred - np.mean(curr_pred)
-        true_prime = true - np.mean(true)
-
-        acc = np.sum(weights_lat * pred_prime * true_prime) / np.sqrt(np.sum(weights_lat * pred_prime ** 2) * np.sum(weights_lat * true_prime ** 2))
-        acc_list.append(acc)
-
-    return acc_list
-
-
-def evaluation_crps_mm(pred, truth, lat, lon, max_vals, min_vals, H, W, levels, sigma):
-    CRPS_final = []
-
-    for idx, lev in enumerate(levels):
-        pred_spectral = pred[idx].detach().cpu().numpy()
-        true_spectral = truth[idx, :, :].detach().cpu().numpy()
-        std_spectral = sigma[idx].detach().cpu().numpy()
-
-        curr_pred = pred_spectral * (max_vals[idx] - min_vals[idx]) + min_vals[idx]
-        true = true_spectral * (max_vals[idx] - min_vals[idx]) + min_vals[idx]
-
-        crps = ps.crps_gaussian(true_spectral, mu=pred_spectral, sig=std_spectral)
-        CRPS_final.append(crps)
-
-    return CRPS_final
+    return torch.sum(acc_per_sample_per_level, dim=batch_dim)

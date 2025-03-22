@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional, Tuple, Union
 
 
 class BoundaryPad(nn.Module):
@@ -38,7 +37,7 @@ class ResidualBlock(nn.Module):
         else:
             self.shortcut = nn.Identity()
 
-        # See GroupNorm here : https://arxiv.org/pdf/1803.08494
+        #  See GroupNorm here : https://arxiv.org/pdf/1803.08494
         if norm:
             self.norm1 = nn.GroupNorm(n_groups, in_channels)
             self.norm2 = nn.GroupNorm(n_groups, out_channels)
@@ -87,7 +86,7 @@ class SelfAttnConv(nn.Module):
             nn.LeakyReLU(0.3),
             BoundaryPad(),
             nn.Conv2d(n_out, n_out, kernel_size=(3, 3), stride=stride, padding=0)
-            )
+        )
 
     def key_conv(self, n_in, n_out, stride):
         return nn.Sequential(
@@ -96,7 +95,7 @@ class SelfAttnConv(nn.Module):
             nn.Conv2d(n_in // 2, n_out, kernel_size=(3, 3), stride=stride, padding=0),
             nn.LeakyReLU(0.3),
             nn.Conv2d(n_out, n_out, kernel_size=(3, 3), stride=1, padding=0)
-            )
+        )
 
     def forward(self, x):
         size = x.size()

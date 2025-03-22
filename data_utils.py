@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import torch
 import numpy as np
 from torch.utils.data import Dataset
+import pickle
 
 
 def dt64_to_long(dt64):
@@ -14,7 +15,7 @@ def long_to_dt64(long_):
 
 
 class utvDataset(Dataset):
-    def __init__(self, states, velocities, timestamps, n_steps):
+    def __init__(self, states, velocities, timestamps, n_steps, window_step):
         """
         Initialize the dataset with states and timestamps.
 
@@ -27,11 +28,13 @@ class utvDataset(Dataset):
         self.timestamps = timestamps
         self.velocities = velocities
         self.n_steps = n_steps
+        self.window_step = window_step
         self.seconds_in_an_hour = 3600
+        self.minutes_in_a_day = 1440
 
     # Based on : https://stackoverflow.com/questions/13703720/converting-between-datetime-timestamp-and-datetime64
     def _dt64_to_dt(self, dt64):
-        ts = (dt64 - np.datetime64('1970-01-01T00:00:00Z')) / np.timedelta64(1, 's')
+        ts = (dt64 - np.datetime64('1970-01-01T00:00:00')) / np.timedelta64(1, 's')
         return datetime.fromtimestamp(ts, tz=timezone.utc)
 
     def normalize_time_over_year(self, timestamp):
@@ -51,10 +54,26 @@ class utvDataset(Dataset):
 
         return elapsed_hours / total_hours_in_year
 
+    def get_hours_since_beginning_of_the_year(self, timestamp):
+
+        if isinstance(timestamp, np.datetime64):
+            timestamp = self._dt64_to_dt(timestamp)
+
+        start_of_year = datetime(timestamp.year, 1, 1, tzinfo=timezone.utc)
+        end_of_year = datetime(timestamp.year + 1, 1, 1, tzinfo=timezone.utc)
+
+        # Total seconds in the year
+        # total_hours_in_year = (end_of_year - start_of_year).total_seconds() / self.seconds_in_an_hour
+
+        # Elapsed seconds since the start of the year
+        elapsed_hours = (timestamp - start_of_year).total_seconds() / self.seconds_in_an_hour
+
+        return elapsed_hours
+
     def __len__(self):
         """Return the total number of samples."""
         # Remove self.n_steps because the last items would not make a full sequence
-        return len(self.states) - self.n_steps
+        return (len(self.states) - self.n_steps)//self.window_step
 
     def __getitem__(self, idx):
         """
@@ -66,9 +85,10 @@ class utvDataset(Dataset):
         Returns:
             dict: A dictionary with 'u', 't', 'v0', 'timestamps'.
         """
+        idx *= self.window_step
         return {
             'u'         : self.states[idx:idx + self.n_steps],  # u
-            't'         : torch.tensor([self.normalize_time_over_year(ts) for ts in self.timestamps[idx:idx + self.n_steps]]),
+            't'         : torch.tensor([self.get_hours_since_beginning_of_the_year(ts) for ts in self.timestamps[idx:idx + self.n_steps]]),
             #  'timestamps': torch.tensor([dt64_to_long(ts.item()) for ts in self.timestamps[idx:idx + self.n_steps]], dtype=torch.long),
             # NOTE : ndarray is used for timestamps to use np.datetime64 as torch does not allow to store datetime types in tensors
             'v0'        : self.velocities[idx],  #  v0
@@ -108,7 +128,7 @@ def fetch_constant_info(path, vars_to_fetch=None):
     return constants_data, torch.from_numpy(data['lat2d'].values), torch.from_numpy(data['lon2d'].values)
 
 
-def get_resampled_normalized_data(data_path, min_date, max_date, level, sampling_time=6):
+def get_resampled_normalized_data(data_path, min_date, max_date, level, sampling_time=6, norm='minmax', scales=None):
     sampling_time_str = f"{sampling_time}h"
     data = xr.open_mfdataset(data_path, combine='by_coords')
     # data = data.isel(lat=slice(None, None, -1))
@@ -116,11 +136,47 @@ def get_resampled_normalized_data(data_path, min_date, max_date, level, sampling
         data = data.sel(level=500)
     data = data.resample(time=sampling_time_str).nearest(tolerance="1h")  # Setting data to be 6-hour cycles
     data_global = data.sel(time=slice(min_date, max_date)).load()
-
-    max_val = data_global.max()[level].values.tolist()
-    min_val = data_global.min()[level].values.tolist()
-
-    data_normalised = torch.tensor((data_global[level].values - min_val) / (max_val - min_val)).unsqueeze(1)
     timestamps = data_global.time.values
 
-    return data_normalised, timestamps
+    if norm == 'minmax':
+
+        if scales is None:
+            min_val = data_global.min()[level].values.tolist()
+            max_val = data_global.max()[level].values.tolist()
+        else:
+            min_val, max_val = scales
+
+        data_normalised = torch.tensor((data_global[level].values - min_val) / (max_val - min_val)).unsqueeze(1)
+
+        return data_normalised, timestamps, min_val, max_val
+
+    elif norm == 'standard':
+
+        if scales is None:
+            mean_val = data_global.mean()[level].values.tolist()
+            stddev_val = data_global.std()[level].values.tolist()
+        else:
+            mean_val, stddev_val = scales
+
+        data_normalised = torch.tensor((data_global[level].values - mean_val) / stddev_val).unsqueeze(1)
+
+        return data_normalised, timestamps, mean_val, stddev_val
+
+    else:
+        return torch.tensor(data_global[level].values).unsqueeze(1), timestamps
+
+
+def rescale_minmax(data, min_, max_):
+    # data of shape (batch_size, time, K, H ,W)
+    # min_ and max_ of shape (K)
+    rescaled = torch.zeros_like(data)
+    K = len(min_)
+    for k in range(K):
+        rescaled[:,:,k] = data[:,:,k]*(max_[k] - min_[k]) + min_[k]
+    return rescaled
+
+def load_pickle(load_path):
+    return pickle.load(open(load_path, 'rb'))
+
+def save_pickle(data, save_path):
+    pickle.dump(data, open(save_path, 'wb'))

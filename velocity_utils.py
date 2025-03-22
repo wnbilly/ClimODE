@@ -1,5 +1,3 @@
-import os
-import numpy as np
 import torch
 from torch import nn, optim as optim
 import torch.nn.functional as F

@@ -58,7 +58,7 @@ data = 0
 
 for idx, level_path in enumerate(paths_to_data):
     # loads level by level
-    norm_data, timestamps = get_resampled_normalized_data(level_path, args.min_date, args.max_date, levels[idx])
+    norm_data, timestamps, _, _ = get_resampled_normalized_data(level_path, args.min_date, args.max_date, levels[idx])
 
     if idx == 0:
         data = norm_data
